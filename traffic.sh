@@ -18,7 +18,7 @@
 # -----------------------------------------------------------------------------
 # CONFIGURATION — Adjust to match your server environment
 # -----------------------------------------------------------------------------
-IFACE="eth0"          # Network interface  (check available: ip link show)
+IFACE="eno1"          # Network interface  (check available: ip link show)
 PPS_WARN=10000        # PPS warning threshold  (yellow)
 PPS_CRIT=20000        # PPS critical threshold (red)
 CONN_WARN=50          # Connections per IP warning
@@ -26,8 +26,8 @@ CONN_CRIT=100         # Connections per IP critical
 REQ_WARN=5000         # HTTP requests per domain warning
 REQ_CRIT=10000        # HTTP requests per domain critical
 TOP_N=15              # Number of rows to display per section
-LOG_TAIL=50000        # Lines to read from each domain log
-REFRESH=5             # Screen refresh interval in seconds
+LOG_TAIL=20000        # Lines to read from each domain log
+REFRESH=15            # Screen refresh interval in seconds
 
 # -----------------------------------------------------------------------------
 # PATHS — Standard cPanel/WHM locations
