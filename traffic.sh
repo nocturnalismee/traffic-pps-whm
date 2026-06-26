@@ -9,16 +9,16 @@
 #      ╚═╝   ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝     ╚═╝     ╚═╝ ╚═════╝
 #
 #   Traffic Monitor & Analysis — for cPanel / WHM Edition
-#   Version  : 1.2
+#   Version  : 1.4-fix
 #   Mode     : READ-ONLY  |  SAFETY FIRST
-#   Purpose  : Real-time traffic analysis, PPS monitoring, connection insight,
-#              and domain/source correlation for cPanel / WHM servers
+#   Purpose  : DDoS / bot-oriented traffic analysis with PPS monitoring,
+#              connection insight, and domain/source correlation for
+#              cPanel / WHM servers
 #   Contributors : nocturnalismee <https://github.com/nocturnalismee>
 # -----------------------------------------------------------------------------
 
 # -----------------------------------------------------------------------------
 # CONFIGURATION — Tune these values to match your server environment
-# -----------------------------------------------------------------------------
 IFACE="eno1"          # Network interface  (check available: ip link show)
 PPS_WARN=10000        # PPS warning threshold  (yellow)
 PPS_CRIT=20000        # PPS critical threshold (red)
@@ -29,17 +29,18 @@ REQ_CRIT=10000        # HTTP requests per domain critical
 TOP_N=15              # Number of rows to display per section
 LOG_TAIL=20000        # Lines to read from each domain log
 REFRESH=15            # Screen refresh interval in seconds
+ATTACK_SCORE_WARN=2   # Attack signal score threshold for warning
+ATTACK_SCORE_CRIT=4   # Attack signal score threshold for critical
+REQ_VIEW_MODE="delta" # Request ranking mode: "delta" or "window"
 
-# -----------------------------------------------------------------------------
+
 # PATHS — Standard cPanel/WHM locations
-# -----------------------------------------------------------------------------
 DOMLOGS="/usr/local/apache/domlogs"
 USERDOMAINS="/etc/userdomains"
 DOMAINIPS="/etc/domainips"
 
-# -----------------------------------------------------------------------------
+
 # TERMINAL COLORS
-# -----------------------------------------------------------------------------
 C_RED='\033[0;31m'
 C_YEL='\033[1;33m'
 C_GRN='\033[0;32m'
@@ -51,12 +52,10 @@ C_DIM='\033[2m'
 C_BLD='\033[1m'
 C_RST='\033[0m'
 
-# Colors kept for future customization.
 : "${C_BLU}" "${C_MAG}"
 
-# -----------------------------------------------------------------------------
-# RUNTIME STATE — Cached data and validation metadata used during each refresh
-# -----------------------------------------------------------------------------
+
+# RUNTIME STATE
 TMPDIR_TMA=""
 DOMAINIPS_MODE="unavailable"
 DOMAINIPS_WARNING=""
@@ -66,6 +65,10 @@ NET_TX_PPS=0
 NET_TOTAL_PPS=0
 NET_RX_KB=0
 NET_TX_KB=0
+WEB_PORTS_REGEX='^(80|443)$'
+
+# FIX #6: Owner cache — associative array loaded once at startup
+declare -A OWNER_CACHE_MAP
 
 cleanup() {
   if [[ -n "$TMPDIR_TMA" && -d "$TMPDIR_TMA" ]]; then
@@ -90,15 +93,18 @@ init_tmpdir() {
   }
 }
 
-# -----------------------------------------------------------------------------
-# HELPERS — Shared utilities for rendering, parsing, validation, and caching
-# -----------------------------------------------------------------------------
+# HELPERS
 separator() {
   echo -e "${C_DIM}  ────────────────────────────────────────────────────────${C_RST}"
 }
 
 is_positive_integer() {
   [[ "$1" =~ ^[0-9]+$ ]] && (( $1 > 0 ))
+}
+
+# FIX #8: Sanitize integer — prevent arithmetic errors from empty/non-numeric values
+sanitize_int() {
+  [[ "$1" =~ ^[0-9]+$ ]] && printf '%d' "$1" || printf '0'
 }
 
 validate_config() {
@@ -134,36 +140,47 @@ validate_config() {
     ok=0
   fi
 
+  if ! is_positive_integer "$ATTACK_SCORE_WARN" || ! is_positive_integer "$ATTACK_SCORE_CRIT" || (( ATTACK_SCORE_WARN >= ATTACK_SCORE_CRIT )); then
+    echo -e "  ${C_RED}✘${C_RST}  Invalid ATTACK score thresholds (warn must be < crit)"
+    ok=0
+  fi
+
+  if [[ "$REQ_VIEW_MODE" != "delta" && "$REQ_VIEW_MODE" != "window" ]]; then
+    echo -e "  ${C_RED}✘${C_RST}  Invalid REQ_VIEW_MODE : ${C_RED}${REQ_VIEW_MODE}${C_RST} (use \"delta\" or \"window\")"
+    ok=0
+  fi
+
   if (( ok == 0 )); then
     echo -e "\n  ${C_RED}Configuration validation failed. Fix CONFIGURATION values and rerun.${C_RST}\n"
     exit 1
   fi
 }
 
-resolve_owner() {
-  local domain="$1"
-  local owner
-  [[ -f "$USERDOMAINS" ]] || { echo "n/a"; return; }
-  owner=$(awk -v dom="$domain" '
-    function trim(s) {
-      sub(/^[[:space:]]+/, "", s)
-      sub(/[[:space:]]+$/, "", s)
-      return s
-    }
-    /^[[:space:]]*#/ || /^[[:space:]]*$/ { next }
+# FIX #6: Preload owner cache from /etc/userdomains
+preload_owner_cache() {
+  [[ -f "$USERDOMAINS" ]] || return
+  while IFS=$'\t' read -r domain owner; do
+    [[ -n "$domain" ]] && OWNER_CACHE_MAP["$domain"]="$owner"
+  done < <(awk -F'[:=]' '
+    /^[[:space:]]*$/ || /^[[:space:]]*#/ { next }
     {
-      line = $0
-      if (match(line, /^[[:space:]]*([^:=[:space:]]+)[[:space:]]*[:=][[:space:]]*(.+)$/, m)) {
-        key = trim(m[1])
-        val = trim(m[2])
-        if (key == dom) {
-          print val
-          exit
-        }
-      }
+      sub(/^[[:space:]]+/, "", $1)
+      sub(/[[:space:]]+$/, "", $1)
+      sub(/^[[:space:]]+/, "", $2)
+      sub(/[[:space:]]+$/, "", $2)
+      if ($1 != "") print $1 "\t" $2
     }
   ' "$USERDOMAINS" 2>/dev/null)
-  echo "${owner:-n/a}"
+}
+
+# FIX #6: resolve_owner now uses in-memory cache — no awk per call
+resolve_owner() {
+  local domain="$1"
+  if [[ -n "${OWNER_CACHE_MAP[$domain]+_}" ]]; then
+    echo "${OWNER_CACHE_MAP[$domain]}"
+  else
+    echo "n/a"
+  fi
 }
 
 severity_badge() {
@@ -183,6 +200,117 @@ severity_badge() {
   else
     printf '%b' "${C_GRN}● NORMAL  ${C_RST}"
   fi
+}
+
+attack_badge() {
+  local score="$1"
+  if ! [[ "$score" =~ ^[0-9]+$ ]]; then
+    printf '%b' "${C_GRN}● NORMAL  ${C_RST}"
+    return
+  fi
+
+  if (( score >= ATTACK_SCORE_CRIT )); then
+    printf '%b' "${C_RED}● ATTACK LIKELY${C_RST}"
+  elif (( score >= ATTACK_SCORE_WARN )); then
+    printf '%b' "${C_YEL}● SUSPICIOUS   ${C_RST}"
+  else
+    printf '%b' "${C_GRN}● NORMAL       ${C_RST}"
+  fi
+}
+
+request_view_suffix() {
+  if [[ "$REQ_VIEW_MODE" == "delta" ]]; then
+    printf 'delta'
+  else
+    printf 'current'
+  fi
+}
+
+request_view_hint() {
+  if [[ "$REQ_VIEW_MODE" == "delta" ]]; then
+    printf 'delta since previous refresh'
+  else
+    printf 'recent cached log window'
+  fi
+}
+
+delta_baseline_ready() {
+  [[ -f "${TMPDIR_TMA}/delta_ready" ]]
+}
+
+delta_output_ready() {
+  [[ -f "${TMPDIR_TMA}/delta_output_ready" ]]
+}
+
+count_view_file() {
+  local stem="$1"
+  printf '%s/%s_%s' "$TMPDIR_TMA" "$stem" "$(request_view_suffix)"
+}
+
+# FIX #9: New aggregation for "count key" input format (sums instead of uniq -c)
+aggregate_sum_counts() {
+  local input_file="$1"
+  local output_file="$2"
+
+  if [[ -s "$input_file" ]]; then
+    awk '{
+      key = $2
+      for (i = 3; i <= NF; i++) key = key " " $i
+      total[key] += $1
+    }
+    END {
+      for (key in total) print total[key], key
+    }' "$input_file" > "$output_file"
+  else
+    : > "$output_file"
+  fi
+}
+
+aggregate_simple_counts() {
+  local input_file="$1"
+  local output_file="$2"
+
+  if [[ -s "$input_file" ]]; then
+    sort "$input_file" | uniq -c | \
+      awk '{ key=$2; for (i=3; i<=NF; i++) key=key " " $i; print $1, key }' > "$output_file"
+  else
+    : > "$output_file"
+  fi
+}
+
+# FIX #3: Don't clear previous_file when current is empty — preserve baseline
+compute_delta_counts() {
+  local current_file="$1"
+  local previous_file="$2"
+  local delta_file="$3"
+
+  if [[ ! -s "$current_file" ]]; then
+    : > "$delta_file"
+    # FIX: removed `: > "$previous_file"` — keep baseline for next cycle
+    return
+  fi
+
+  if [[ -s "$previous_file" ]]; then
+    awk '
+      NR == FNR {
+        key = $2
+        for (i = 3; i <= NF; i++) key = key " " $i
+        prev[key] = $1
+        next
+      }
+      {
+        key = $2
+        for (i = 3; i <= NF; i++) key = key " " $i
+        delta = $1 - ((key in prev) ? prev[key] : 0)
+        if (delta < 0) delta = 0
+        print delta, key
+      }
+    ' "$previous_file" "$current_file" > "$delta_file"
+  else
+    : > "$delta_file"
+  fi
+
+  cp "$current_file" "$previous_file"
 }
 
 logfiles_for_domain() {
@@ -233,39 +361,68 @@ cache_ss_output() {
   ss -ntu state established 2>/dev/null > "${TMPDIR_TMA}/ss_output"
 }
 
+# FIX #8: Sanitize all /sys reads + handle negative PPS on counter reset
 sample_network() {
   local sys="/sys/class/net/${IFACE}/statistics"
   local rx1 tx1 rxb1 txb1 rx2 tx2 rxb2 txb2
 
-  rx1=$(cat "${sys}/rx_packets" 2>/dev/null) || rx1=0
-  tx1=$(cat "${sys}/tx_packets" 2>/dev/null) || tx1=0
-  rxb1=$(cat "${sys}/rx_bytes" 2>/dev/null) || rxb1=0
-  txb1=$(cat "${sys}/tx_bytes" 2>/dev/null) || txb1=0
+  rx1=$(sanitize_int "$(cat "${sys}/rx_packets" 2>/dev/null)")
+  tx1=$(sanitize_int "$(cat "${sys}/tx_packets" 2>/dev/null)")
+  rxb1=$(sanitize_int "$(cat "${sys}/rx_bytes" 2>/dev/null)")
+  txb1=$(sanitize_int "$(cat "${sys}/tx_bytes" 2>/dev/null)")
 
   sleep 1
 
-  rx2=$(cat "${sys}/rx_packets" 2>/dev/null) || rx2=0
-  tx2=$(cat "${sys}/tx_packets" 2>/dev/null) || tx2=0
-  rxb2=$(cat "${sys}/rx_bytes" 2>/dev/null) || rxb2=0
-  txb2=$(cat "${sys}/tx_bytes" 2>/dev/null) || txb2=0
+  rx2=$(sanitize_int "$(cat "${sys}/rx_packets" 2>/dev/null)")
+  tx2=$(sanitize_int "$(cat "${sys}/tx_packets" 2>/dev/null)")
+  rxb2=$(sanitize_int "$(cat "${sys}/rx_bytes" 2>/dev/null)")
+  txb2=$(sanitize_int "$(cat "${sys}/tx_bytes" 2>/dev/null)")
 
-  NET_RX_PPS=$(( rx2 - rx1 ))
-  NET_TX_PPS=$(( tx2 - tx1 ))
+  # FIX #12: Clamp to 0 on counter reset (negative values)
+  NET_RX_PPS=$(( rx2 - rx1 )); (( NET_RX_PPS < 0 )) && NET_RX_PPS=0
+  NET_TX_PPS=$(( tx2 - tx1 )); (( NET_TX_PPS < 0 )) && NET_TX_PPS=0
   NET_TOTAL_PPS=$(( NET_RX_PPS + NET_TX_PPS ))
-  NET_RX_KB=$(( (rxb2 - rxb1) / 1024 ))
-  NET_TX_KB=$(( (txb2 - txb1) / 1024 ))
+  NET_RX_KB=$(( (rxb2 - rxb1) / 1024 )); (( NET_RX_KB < 0 )) && NET_RX_KB=0
+  NET_TX_KB=$(( (txb2 - txb1) / 1024 )); (( NET_TX_KB < 0 )) && NET_TX_KB=0
 }
 
 cache_log_data() {
   local cache_file="${TMPDIR_TMA}/log_data"
-  local domain_counts="${TMPDIR_TMA}/domain_counts"
+  local domain_counts_raw="${TMPDIR_TMA}/domain_counts_raw"
   local domain_list="${TMPDIR_TMA}/domain_list"
   local tail_tmp="${TMPDIR_TMA}/_tail_tmp"
+  local path_counts="${TMPDIR_TMA}/path_counts"
+  local ua_counts="${TMPDIR_TMA}/ua_counts"
+  local status_counts="${TMPDIR_TMA}/status_counts"
+  local ip_hits="${TMPDIR_TMA}/ip_hits"
+  local domain_error_hits="${TMPDIR_TMA}/domain_error_hits"
+  local ip_error_hits="${TMPDIR_TMA}/ip_error_hits"
+  local domain_counts_current="${TMPDIR_TMA}/domain_counts_current"
+  local domain_counts_previous="${TMPDIR_TMA}/domain_counts_previous"
+  local domain_counts_delta="${TMPDIR_TMA}/domain_counts_delta"
+  local ip_counts_current="${TMPDIR_TMA}/ip_counts_current"
+  local ip_counts_previous="${TMPDIR_TMA}/ip_counts_previous"
+  local ip_counts_delta="${TMPDIR_TMA}/ip_counts_delta"
+  local domain_error_counts_current="${TMPDIR_TMA}/domain_error_counts_current"
+  local domain_error_counts_previous="${TMPDIR_TMA}/domain_error_counts_previous"
+  local domain_error_counts_delta="${TMPDIR_TMA}/domain_error_counts_delta"
+  local ip_error_counts_current="${TMPDIR_TMA}/ip_error_counts_current"
+  local ip_error_counts_previous="${TMPDIR_TMA}/ip_error_counts_previous"
+  local ip_error_counts_delta="${TMPDIR_TMA}/ip_error_counts_delta"
+  local had_previous=0
 
   [[ -n "$TMPDIR_TMA" && -d "$TMPDIR_TMA" ]] || return
   : > "$cache_file"
-  : > "$domain_counts"
+  : > "$domain_counts_raw"
+  : > "$path_counts"
+  : > "$ua_counts"
+  : > "$status_counts"
+  : > "$ip_hits"
+  : > "$domain_error_hits"
+  : > "$ip_error_hits"
   [[ -s "$domain_list" ]] || return
+
+  [[ -s "$domain_counts_previous" ]] && had_previous=1
 
   local domain logfile lc
   while IFS= read -r domain; do
@@ -282,18 +439,123 @@ cache_log_data() {
     lc=${lc// /}
 
     if [[ -n "$lc" && "$lc" -gt 0 ]] 2>/dev/null; then
-      printf "%d %s\n" "$lc" "$domain" >> "$domain_counts"
-      awk -v dom="$domain" '
-        $1 ~ /^([0-9]{1,3}\.){3}[0-9]{1,3}$/ || $1 ~ /^[0-9A-Fa-f:]+$/ {
-          print $1, dom
+      printf "%d %s\n" "$lc" "$domain" >> "$domain_counts_raw"
+
+      # FIX #4: Replaced all 3-arg match() with portable alternatives
+      # FIX #9: Write count+key directly instead of one-line-per-occurrence
+      awk -v dom="$domain" -v ip_file="$cache_file" -v path_file="$path_counts" \
+        -v ua_file="$ua_counts" -v status_file="$status_counts" \
+        -v ip_hits_file="$ip_hits" -v domain_error_hits_file="$domain_error_hits" \
+        -v ip_error_hits_file="$ip_error_hits" '
+        function trim(s) {
+          sub(/^[[:space:]]+/, "", s)
+          sub(/[[:space:]]+$/, "", s)
+          return s
         }
-      ' "$tail_tmp" >> "$cache_file"
+        function short_ua(s, maxlen) {
+          s = trim(s)
+          if (s == "" || s == "-") return "-"
+          if (length(s) > maxlen) return substr(s, 1, maxlen - 3) "..."
+          return s
+        }
+        {
+          ip = $1
+          is_valid_ip = (ip ~ /^([0-9]{1,3}\.){3}[0-9]{1,3}$/ || ip ~ /^[0-9A-Fa-f:]+$/)
+
+          if (is_valid_ip) {
+            # FIX #9: accumulate counts in arrays, write aggregated in END
+            ip_dom_key = ip SUBSEP dom
+            ip_dom_seen[ip_dom_key]++
+            ip_seen[ip]++
+          }
+
+          quote_count = split($0, q, "\"")
+          request = (quote_count >= 2 ? q[2] : "")
+          rest = (quote_count >= 3 ? q[3] : "")
+          ua = (quote_count >= 6 ? q[6] : "-")
+
+          split(request, req_parts, " ")
+          path = trim(req_parts[2])
+          if (path == "" || path == "-") path = "/"
+          sub(/\?.*$/, "", path)
+          if (path == "") path = "/"
+
+          # FIX #4: Portable status extraction — no 3-arg match()
+          status = ""
+          sub(/^[[:space:]]+/, "", rest)
+          split(rest, rest_arr, /[[:space:]]+/)
+          if (rest_arr[1] ~ /^[0-9]{3}$/) {
+            status = rest_arr[1]
+          }
+
+          path_seen[path]++
+          if (status != "") {
+            status_seen[status]++
+            if (status ~ /^(4|5)[0-9][0-9]$/) {
+              error_domain_seen[dom]++
+              if (is_valid_ip) {
+                error_ip_seen[ip]++
+              }
+            }
+          }
+          ua = short_ua(ua, 72)
+          ua_seen[ua]++
+        }
+        END {
+          for (path in path_seen) {
+            print path_seen[path], path >> path_file
+          }
+          for (ua in ua_seen) {
+            print ua_seen[ua], ua >> ua_file
+          }
+          for (status in status_seen) {
+            print status_seen[status], status >> status_file
+          }
+          # FIX #9: Write count+key directly (not one line per occurrence)
+          for (ip_dom_key in ip_dom_seen) {
+            split(ip_dom_key, parts, SUBSEP)
+            print ip_dom_seen[ip_dom_key], parts[1], parts[2] >> ip_file
+          }
+          for (ip_key in ip_seen) {
+            print ip_seen[ip_key], ip_key >> ip_hits_file
+          }
+          for (domain_key in error_domain_seen) {
+            print error_domain_seen[domain_key], domain_key >> domain_error_hits_file
+          }
+          for (ip_key in error_ip_seen) {
+            print error_ip_seen[ip_key], ip_key >> ip_error_hits_file
+          }
+        }
+      ' "$tail_tmp"
     fi
   done < "$domain_list"
+
+  cp "$domain_counts_raw" "$domain_counts_current"
+
+  # FIX #9: Use aggregate_sum_counts for pre-aggregated "count key" data
+  aggregate_sum_counts "$ip_hits" "$ip_counts_current"
+  aggregate_sum_counts "$domain_error_hits" "$domain_error_counts_current"
+  aggregate_sum_counts "$ip_error_hits" "$ip_error_counts_current"
+
+  compute_delta_counts "$domain_counts_current" "$domain_counts_previous" "$domain_counts_delta"
+  compute_delta_counts "$ip_counts_current" "$ip_counts_previous" "$ip_counts_delta"
+  compute_delta_counts "$domain_error_counts_current" "$domain_error_counts_previous" "$domain_error_counts_delta"
+  compute_delta_counts "$ip_error_counts_current" "$ip_error_counts_previous" "$ip_error_counts_delta"
+
+  if ! delta_baseline_ready; then
+    : > "${TMPDIR_TMA}/delta_ready"
+  fi
+
+  if (( had_previous == 1 )); then
+    : > "${TMPDIR_TMA}/delta_output_ready"
+  else
+    rm -f "${TMPDIR_TMA}/delta_output_ready"
+  fi
 
   rm -f "$tail_tmp"
 }
 
+# FIX #4: Replaced 3-arg match() with portable index()/substr()
 parse_ss_ips() {
   local field="$1"
   local ss_file="${TMPDIR_TMA}/ss_output"
@@ -304,18 +566,20 @@ parse_ss_ips() {
       sub(/[[:space:]]+$/, "", s)
       return s
     }
-    function extract_host(addr,   host, rest, n, parts, i) {
+    function extract_host(addr,   host, rest, bidx) {
       addr = trim(addr)
       if (addr == "" || addr == "*" || addr == "*:*") return ""
 
+      # Handle IPv6 bracket notation [ip]:port
       if (addr ~ /^\[/) {
-        if (match(addr, /^\[([^]]+)\](:.*)?$/, m)) {
-          return m[1]
-        }
+        rest = substr(addr, 2)
+        bidx = index(rest, "]")
+        if (bidx > 0) return substr(rest, 1, bidx - 1)
       }
 
-      if (match(addr, /^(.*):([^:]*)$/, m)) {
-        host = m[1]
+      # Split on last colon to separate host:port
+      if (match(addr, /:[^:]*$/)) {
+        host = substr(addr, 1, RSTART - 1)
       } else {
         host = addr
       }
@@ -333,6 +597,60 @@ parse_ss_ips() {
   ' "$ss_file" 2>/dev/null
 }
 
+# FIX #2: Corrected field positions — $5=Local, $6=Peer (was $4/$5)
+# FIX #4: Replaced 3-arg match() with portable alternatives
+parse_ss_web_peer_ips() {
+  local ss_file="${TMPDIR_TMA}/ss_output"
+  local web_ports_regex="${1:-$WEB_PORTS_REGEX}"
+
+  awk -v web_ports_regex="$web_ports_regex" '
+    function trim(s) {
+      sub(/^[[:space:]]+/, "", s)
+      sub(/[[:space:]]+$/, "", s)
+      return s
+    }
+    function extract_host(addr,   host, rest, bidx) {
+      addr = trim(addr)
+      if (addr == "" || addr == "*" || addr == "*:*") return ""
+
+      if (addr ~ /^\[/) {
+        rest = substr(addr, 2)
+        bidx = index(rest, "]")
+        if (bidx > 0) return substr(rest, 1, bidx - 1)
+      }
+
+      if (match(addr, /:[^:]*$/)) {
+        host = substr(addr, 1, RSTART - 1)
+      } else {
+        host = addr
+      }
+
+      host = trim(host)
+      if (host == "" || host == "*" || host == "0.0.0.0" || host == "::") return ""
+      return host
+    }
+    function extract_port(addr,   rest) {
+      addr = trim(addr)
+      if (addr == "" || addr == "*" || addr == "*:*") return ""
+      if (match(addr, /:[0-9]+$/)) {
+        rest = substr(addr, RSTART + 1)
+        return rest
+      }
+      return ""
+    }
+    NR > 1 {
+      # FIX #2: Corrected field positions for ss output
+      # $5 = Local Address:Port, $6 = Peer Address:Port
+      local_port = extract_port($5)
+      peer_host = extract_host($6)
+      if (local_port ~ web_ports_regex && peer_host != "") {
+        print peer_host
+      }
+    }
+  ' "$ss_file" 2>/dev/null
+}
+
+# FIX #4: Replaced 3-arg match() with portable index()/substr()
 detect_domainips_mode() {
   DOMAINIPS_MODE="unavailable"
   DOMAINIPS_WARNING=""
@@ -352,28 +670,46 @@ detect_domainips_mode() {
     return
   }
 
+  # FIX #4: Portable parse_pair using index() instead of 3-arg match()
   if awk '
     function trim(s) {
       sub(/^[[:space:]]+/, "", s)
       sub(/[[:space:]]+$/, "", s)
       return s
     }
-    function is_ipv4(s) {
-      return s ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/
-    }
-    function parse_pair(line,   m) {
-      if (match(line, /^([^:=[:space:]]+)[[:space:]]*[:=][[:space:]]*([^[:space:]]+)$/, m)) {
-        first = trim(m[1]); second = trim(m[2]); return 1
+    function parse_pair(line,   idx) {
+      idx = index(line, ":")
+      if (idx > 0) {
+        first = substr(line, 1, idx - 1)
+        second = substr(line, idx + 1)
+        sub(/^[[:space:]]+/, "", first); sub(/[[:space:]]+$/, "", first)
+        sub(/^[[:space:]]+/, "", second); sub(/[[:space:]]+$/, "", second)
+        if (first != "" && second != "") return 1
       }
-      if (match(line, /^([^[:space:]]+)[[:space:]]+([^[:space:]]+)$/, m)) {
-        first = trim(m[1]); second = trim(m[2]); return 1
+      idx = index(line, "=")
+      if (idx > 0) {
+        first = substr(line, 1, idx - 1)
+        second = substr(line, idx + 1)
+        sub(/^[[:space:]]+/, "", first); sub(/[[:space:]]+$/, "", first)
+        sub(/^[[:space:]]+/, "", second); sub(/[[:space:]]+$/, "", second)
+        if (first != "" && second != "") return 1
+      }
+      if (match(line, /[^[:space:]]+[[:space:]]+[^[:space:]]+/)) {
+        rest = substr(line, RSTART)
+        n = split(rest, parts, /[[:space:]]+/)
+        if (n >= 2) { first = parts[1]; second = parts[2]; return 1 }
       }
       return 0
+    }
+    function is_ipv4(s) {
+      return s ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/
     }
     BEGIN { ok = 1 }
     /^[[:space:]]*$/ || /^[[:space:]]*#/ { next }
     {
-      line = trim($0)
+      line = $0
+      sub(/^[[:space:]]+/, "", line)
+      sub(/[[:space:]]+$/, "", line)
       if (!parse_pair(line) || !is_ipv4(first)) { ok = 0; exit }
     }
     END { exit ok ? 0 : 1 }
@@ -388,22 +724,39 @@ detect_domainips_mode() {
       sub(/[[:space:]]+$/, "", s)
       return s
     }
-    function is_ipv4(s) {
-      return s ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/
-    }
-    function parse_pair(line,   m) {
-      if (match(line, /^([^:=[:space:]]+)[[:space:]]*[:=][[:space:]]*([^[:space:]]+)$/, m)) {
-        first = trim(m[1]); second = trim(m[2]); return 1
+    function parse_pair(line,   idx) {
+      idx = index(line, ":")
+      if (idx > 0) {
+        first = substr(line, 1, idx - 1)
+        second = substr(line, idx + 1)
+        sub(/^[[:space:]]+/, "", first); sub(/[[:space:]]+$/, "", first)
+        sub(/^[[:space:]]+/, "", second); sub(/[[:space:]]+$/, "", second)
+        if (first != "" && second != "") return 1
       }
-      if (match(line, /^([^[:space:]]+)[[:space:]]+([^[:space:]]+)$/, m)) {
-        first = trim(m[1]); second = trim(m[2]); return 1
+      idx = index(line, "=")
+      if (idx > 0) {
+        first = substr(line, 1, idx - 1)
+        second = substr(line, idx + 1)
+        sub(/^[[:space:]]+/, "", first); sub(/[[:space:]]+$/, "", first)
+        sub(/^[[:space:]]+/, "", second); sub(/[[:space:]]+$/, "", second)
+        if (first != "" && second != "") return 1
+      }
+      if (match(line, /[^[:space:]]+[[:space:]]+[^[:space:]]+/)) {
+        rest = substr(line, RSTART)
+        n = split(rest, parts, /[[:space:]]+/)
+        if (n >= 2) { first = parts[1]; second = parts[2]; return 1 }
       }
       return 0
+    }
+    function is_ipv4(s) {
+      return s ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/
     }
     BEGIN { ok = 1 }
     /^[[:space:]]*$/ || /^[[:space:]]*#/ { next }
     {
-      line = trim($0)
+      line = $0
+      sub(/^[[:space:]]+/, "", line)
+      sub(/[[:space:]]+$/, "", line)
       if (!parse_pair(line) || !is_ipv4(second)) { ok = 0; exit }
     }
     END { exit ok ? 0 : 1 }
@@ -416,9 +769,9 @@ detect_domainips_mode() {
   DOMAINIPS_WARNING="unsupported format detected"
 }
 
-# -----------------------------------------------------------------------------
-# STARTUP — Validate configuration and environment before entering the monitor loop
-# -----------------------------------------------------------------------------
+
+# STARTUP
+
 validate_environment() {
   local ok=1
 
@@ -426,6 +779,20 @@ validate_environment() {
 
   validate_config
   detect_domainips_mode
+
+  # FIX: Check for required commands
+  local cmd missing=""
+  for cmd in ss awk sort uniq wc tail grep; do
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+      missing="$missing $cmd"
+    fi
+  done
+  if [[ -n "$missing" ]]; then
+    echo -e "  ${C_RED}✘${C_RST}  Missing commands   :${C_RED}${missing}${C_RST}"
+    ok=0
+  else
+    echo -e "  ${C_GRN}✔${C_RST}  Required commands  : all present"
+  fi
 
   if [[ -f "/sys/class/net/${IFACE}/statistics/rx_packets" ]]; then
     echo -e "  ${C_GRN}✔${C_RST}  Network interface  : ${C_BLD}${IFACE}${C_RST}"
@@ -483,17 +850,23 @@ validate_environment() {
 
   if [[ "$ok" -eq 0 ]]; then
     echo -e "  ${C_RED}One or more critical checks failed.${C_RST}"
-    echo -e "  Press ${C_BLD}Enter${C_RST} to continue anyway, or ${C_BLD}Ctrl+C${C_RST} to abort.\n"
-    read -r
+    # FIX #5: Don't hang on non-interactive stdin
+    if [[ -t 0 ]]; then
+      echo -e "  Press ${C_BLD}Enter${C_RST} to continue anyway, or ${C_BLD}Ctrl+C${C_RST} to abort.\n"
+      read -r
+    else
+      echo -e "  ${C_RED}Non-interactive mode — aborting.${C_RST}\n"
+      exit 1
+    fi
   else
     echo -e "  ${C_GRN}All checks passed.${C_RST} Starting monitor in 2 seconds...\n"
     sleep 2
   fi
 }
 
-# -----------------------------------------------------------------------------
-# SECTION: PPS — Packets Per Second (1-second sampled snapshot)
-# -----------------------------------------------------------------------------
+
+# SECTIONS
+
 section_pps() {
   local badge
   badge=$(severity_badge "$NET_RX_PPS" "$PPS_WARN" "$PPS_CRIT")
@@ -505,24 +878,82 @@ section_pps() {
     "Thresholds" "${PPS_WARN} pps" "${PPS_CRIT} pps"
 }
 
-# -----------------------------------------------------------------------------
-# SECTION: Bandwidth — Throughput in KB/s (same 1-second sample window)
-# -----------------------------------------------------------------------------
 section_bandwidth() {
   printf "  ${C_DIM}%-18s${C_RST}  %s KB/s\n" "Download (RX)" "$NET_RX_KB"
   printf "  ${C_DIM}%-18s${C_RST}  %s KB/s\n" "Upload   (TX)" "$NET_TX_KB"
 }
 
-# -----------------------------------------------------------------------------
-# SECTION: Top domains by request count (aggregated from cached domlog reads)
-# -----------------------------------------------------------------------------
-section_top_domains() {
-  local domain_counts="${TMPDIR_TMA}/domain_counts"
+# FIX #7: Cache parse_ss_web_peer_ips result — avoid double parse
+section_attack_summary() {
+  local domain_counts
+  local ip_counts
+  local status_counts="${TMPDIR_TMA}/status_counts"
+  local score=0
+  local top_domain_req=0 top_domain_name="n/a"
+  local top_ip_req=0 top_ip_name="n/a"
+  local top_web_conn_count=0
+  local status_errors=0
+  local badge
 
+  domain_counts=$(count_view_file "domain_counts")
+  ip_counts=$(count_view_file "ip_counts")
+
+  if [[ "$REQ_VIEW_MODE" == "delta" && ! delta_output_ready ]]; then
+    echo -e "  ${C_DIM}Building baseline for delta mode — wait for the next refresh.${C_RST}"
+    return
+  fi
+
+  if [[ -s "$domain_counts" ]]; then
+    read -r top_domain_req top_domain_name < <(sort -rn "$domain_counts" | head -n 1)
+    [[ "$top_domain_req" =~ ^[0-9]+$ ]] || top_domain_req=0
+  fi
+
+  if [[ -s "$ip_counts" ]]; then
+    read -r top_ip_req top_ip_name < <(sort -rn "$ip_counts" | head -n 1)
+    [[ "$top_ip_req" =~ ^[0-9]+$ ]] || top_ip_req=0
+  fi
+
+  # FIX #7: Cache web peer IPs — parse only once
+  local web_peers
+  web_peers=$(parse_ss_web_peer_ips | grep -Ev '^$|^127\.|^::1$|^\*$')
+  if [[ -n "$web_peers" ]]; then
+    read -r top_web_conn_count _ < <(echo "$web_peers" | sort | uniq -c | sort -rn | head -n 1)
+    [[ "$top_web_conn_count" =~ ^[0-9]+$ ]] || top_web_conn_count=0
+  fi
+
+  if [[ -s "$status_counts" ]]; then
+    status_errors=$(awk '$2 ~ /^(4|5)[0-9][0-9]$/ { sum += $1 } END { print sum + 0 }' "$status_counts")
+  fi
+
+  (( NET_RX_PPS > PPS_WARN )) && (( score++ ))
+  (( top_domain_req > REQ_WARN )) && (( score++ ))
+  (( top_ip_req > REQ_WARN )) && (( score++ ))
+  (( top_web_conn_count > CONN_WARN )) && (( score++ ))
+  (( status_errors > REQ_WARN )) && (( score++ ))
+
+  badge=$(attack_badge "$score")
+
+  printf "  ${C_DIM}%-18s${C_RST}  %s / 5   %b\n" "Signal score" "$score" "$badge"
+  printf "  ${C_DIM}%-18s${C_RST}  %-32s  %s req\n" "Top domain" "$top_domain_name" "$top_domain_req"
+  printf "  ${C_DIM}%-18s${C_RST}  %-32s  %s req\n" "Top source IP" "$top_ip_name" "$top_ip_req"
+  printf "  ${C_DIM}%-18s${C_RST}  %s web peer connections\n" "Top peer IP" "$top_web_conn_count"
+  printf "  ${C_DIM}%-18s${C_RST}  %s responses (4xx/5xx)\n" "HTTP errors" "$status_errors"
+}
+
+# FIX #11: Removed local from piped while-loop bodies
+section_top_domains() {
+  local domain_counts
+  domain_counts=$(count_view_file "domain_counts")
+
+  if [[ "$REQ_VIEW_MODE" == "delta" && ! delta_output_ready ]]; then
+    echo -e "  ${C_DIM}Baseline collected. Delta data will appear on the next refresh.${C_RST}"
+    return
+  fi
+
+  local count domain owner proto badge
   if [[ -s "$domain_counts" ]]; then
     sort -rn "$domain_counts" | head -n "$TOP_N" | \
       while read -r count domain; do
-        local owner proto badge
         owner=$(resolve_owner "$domain")
         [[ -n "$owner" ]] || owner="n/a"
         proto=$(proto_tag "$domain")
@@ -535,37 +966,63 @@ section_top_domains() {
   fi
 }
 
-# -----------------------------------------------------------------------------
-# SECTION: Active connections per peer IP (live, from cached ss output)
-# -----------------------------------------------------------------------------
 section_active_connections() {
   local result
-  result=$(parse_ss_ips 5 | \
+  # FIX #2: parse_ss_web_peer_ips now correctly uses $5/$6 — peer IPs are extracted properly
+  result=$(parse_ss_web_peer_ips | \
     grep -Ev '^$|^127\.|^::1$|^\*$' | \
     sort | uniq -c | sort -rn | head -n "$TOP_N")
 
+  local count ip badge
   if [[ -n "$result" ]]; then
     echo "$result" | \
       while read -r count ip; do
-        local badge
         badge=$(severity_badge "$count" "$CONN_WARN" "$CONN_CRIT")
         printf "  %6s conn  %-30s  %b\n" "$count" "$ip" "$badge"
       done
   else
-    echo -e "  ${C_DIM}No active connections detected.${C_RST}"
+    echo -e "  ${C_DIM}No active web connections detected on ports 80/443.${C_RST}"
   fi
 }
 
-# -----------------------------------------------------------------------------
-# SECTION: Top source IPs aggregated across all cached domain log samples
-# -----------------------------------------------------------------------------
-section_top_ips_global() {
-  local log_data="${TMPDIR_TMA}/log_data"
+section_top_paths() {
+  local path_counts="${TMPDIR_TMA}/path_counts"
 
-  if [[ -s "$log_data" ]]; then
-    awk '{print $1}' "$log_data" | sort | uniq -c | sort -rn | head -n "$TOP_N" | \
+  local count path badge
+  if [[ -s "$path_counts" ]]; then
+    awk '{
+      count = $1
+      $1 = ""
+      key = substr($0, 2)
+      total[key] += count
+    }
+    END {
+      for (key in total) {
+        print total[key], key
+      }
+    }' "$path_counts" | sort -rn | head -n "$TOP_N" | \
+      while read -r count path; do
+        badge=$(severity_badge "$count" "$REQ_WARN" "$REQ_CRIT")
+        printf "  %9s hit  %-52s  %b\n" "$count" "$path" "$badge"
+      done
+  else
+    echo -e "  ${C_DIM}No path data available.${C_RST}"
+  fi
+}
+
+section_top_ips_global() {
+  local ip_counts
+  ip_counts=$(count_view_file "ip_counts")
+
+  if [[ "$REQ_VIEW_MODE" == "delta" && ! delta_output_ready ]]; then
+    echo -e "  ${C_DIM}Baseline collected. Delta data will appear on the next refresh.${C_RST}"
+    return
+  fi
+
+  local count ip badge
+  if [[ -s "$ip_counts" ]]; then
+    sort -rn "$ip_counts" | head -n "$TOP_N" | \
       while read -r count ip; do
-        local badge
         badge=$(severity_badge "$count" "$REQ_WARN" "$REQ_CRIT")
         printf "  %9s req  %-30s  %b\n" "$count" "$ip" "$badge"
       done
@@ -574,16 +1031,107 @@ section_top_ips_global() {
   fi
 }
 
-# -----------------------------------------------------------------------------
-# SECTION: Source IP → target domain correlation
-# -----------------------------------------------------------------------------
+section_top_domains_errors() {
+  local error_counts
+  error_counts=$(count_view_file "domain_error_counts")
+
+  if [[ "$REQ_VIEW_MODE" == "delta" && ! delta_output_ready ]]; then
+    echo -e "  ${C_DIM}Baseline collected. Delta error data will appear on the next refresh.${C_RST}"
+    return
+  fi
+
+  local count domain owner badge
+  if [[ -s "$error_counts" ]]; then
+    sort -rn "$error_counts" | head -n "$TOP_N" | \
+      while read -r count domain; do
+        owner=$(resolve_owner "$domain")
+        [[ -n "$owner" ]] || owner="n/a"
+        badge=$(severity_badge "$count" "$REQ_WARN" "$REQ_CRIT")
+        printf "  %9s err  %-38s  owner: %-14s  %b\n" \
+          "$count" "$domain" "$owner" "$badge"
+      done
+  else
+    echo -e "  ${C_DIM}No 4xx/5xx domain data available.${C_RST}"
+  fi
+}
+
+section_top_ips_errors() {
+  local error_counts
+  error_counts=$(count_view_file "ip_error_counts")
+
+  if [[ "$REQ_VIEW_MODE" == "delta" && ! delta_output_ready ]]; then
+    echo -e "  ${C_DIM}Baseline collected. Delta error data will appear on the next refresh.${C_RST}"
+    return
+  fi
+
+  local count ip badge
+  if [[ -s "$error_counts" ]]; then
+    sort -rn "$error_counts" | head -n "$TOP_N" | \
+      while read -r count ip; do
+        badge=$(severity_badge "$count" "$REQ_WARN" "$REQ_CRIT")
+        printf "  %9s err  %-30s  %b\n" "$count" "$ip" "$badge"
+      done
+  else
+    echo -e "  ${C_DIM}No 4xx/5xx IP data available.${C_RST}"
+  fi
+}
+
+section_top_user_agents() {
+  local ua_counts="${TMPDIR_TMA}/ua_counts"
+
+  local count ua badge
+  if [[ -s "$ua_counts" ]]; then
+    awk '{
+      count = $1
+      $1 = ""
+      key = substr($0, 2)
+      total[key] += count
+    }
+    END {
+      for (key in total) {
+        print total[key], key
+      }
+    }' "$ua_counts" | sort -rn | head -n "$TOP_N" | \
+      while read -r count ua; do
+        badge=$(severity_badge "$count" "$REQ_WARN" "$REQ_CRIT")
+        printf "  %9s req  %-52s  %b\n" "$count" "$ua" "$badge"
+      done
+  else
+    echo -e "  ${C_DIM}No user-agent data available.${C_RST}"
+  fi
+}
+
+section_status_codes() {
+  local status_counts="${TMPDIR_TMA}/status_counts"
+
+  local count status badge
+  if [[ -s "$status_counts" ]]; then
+    awk '{
+      total[$2] += $1
+    }
+    END {
+      for (key in total) {
+        print total[key], key
+      }
+    }' "$status_counts" | sort -rn | head -n "$TOP_N" | \
+      while read -r count status; do
+        badge=$(severity_badge "$count" "$REQ_WARN" "$REQ_CRIT")
+        printf "  %9s resp  %-8s  %b\n" "$count" "$status" "$badge"
+      done
+  else
+    echo -e "  ${C_DIM}No HTTP status data available.${C_RST}"
+  fi
+}
+
+# FIX #9: Updated to handle "count ip domain" format from aggregated log_data
 section_ip_to_domain() {
   local log_data="${TMPDIR_TMA}/log_data"
 
+  local count ip domain owner
   if [[ -s "$log_data" ]]; then
-    sort "$log_data" | uniq -c | sort -rn | head -n "$TOP_N" | \
+    # Data is already in "count ip domain" format from aggregate_sum_counts
+    sort -rn "$log_data" | head -n "$TOP_N" | \
       while read -r count ip domain; do
-        local owner
         owner=$(resolve_owner "$domain")
         [[ -n "$owner" ]] || owner="n/a"
         printf "  %9s req  %-28s  →  %-34s  owner: %s\n" \
@@ -594,9 +1142,8 @@ section_ip_to_domain() {
   fi
 }
 
-# -----------------------------------------------------------------------------
-# SECTION: Dedicated IP connection activity derived from live socket data
-# -----------------------------------------------------------------------------
+# FIX #2: parse_ss_ips 5 gets Local Address:Port — correct for dedicated IP matching
+# FIX #4: Portable AWK in parse_pair
 section_dedicated_ips() {
   if [[ ! -f "$DOMAINIPS" ]]; then
     echo -e "  ${C_DIM}${DOMAINIPS} not found — section unavailable.${C_RST}"
@@ -611,24 +1158,38 @@ section_dedicated_ips() {
   local found=0
   local pairs
   local local_ips
+
+  # FIX #4: Portable parse_pair using index() instead of 3-arg match()
   pairs=$(awk -v mode="$DOMAINIPS_MODE" '
     function trim(s) {
       sub(/^[[:space:]]+/, "", s)
       sub(/[[:space:]]+$/, "", s)
       return s
     }
-    function parse_pair(line,   m) {
-      if (match(line, /^([^:=[:space:]]+)[[:space:]]*[:=][[:space:]]*([^[:space:]]+)$/, m)) {
-        first = trim(m[1]); second = trim(m[2]); return 1
+    function parse_pair(line,   idx) {
+      idx = index(line, ":")
+      if (idx > 0) {
+        first = substr(line, 1, idx - 1)
+        second = substr(line, idx + 1)
+        sub(/^[[:space:]]+/, "", first); sub(/[[:space:]]+$/, "", first)
+        sub(/^[[:space:]]+/, "", second); sub(/[[:space:]]+$/, "", second)
+        if (first != "" && second != "") return 1
       }
-      if (match(line, /^([^[:space:]]+)[[:space:]]+([^[:space:]]+)$/, m)) {
-        first = trim(m[1]); second = trim(m[2]); return 1
+      idx = index(line, "=")
+      if (idx > 0) {
+        first = substr(line, 1, idx - 1)
+        second = substr(line, idx + 1)
+        sub(/^[[:space:]]+/, "", first); sub(/[[:space:]]+$/, "", first)
+        sub(/^[[:space:]]+/, "", second); sub(/[[:space:]]+$/, "", second)
+        if (first != "" && second != "") return 1
       }
       return 0
     }
     /^[[:space:]]*$/ || /^[[:space:]]*#/ { next }
     {
-      line = trim($0)
+      line = $0
+      sub(/^[[:space:]]+/, "", line)
+      sub(/[[:space:]]+$/, "", line)
       if (!parse_pair(line)) next
     }
     mode == "ip-first" {
@@ -645,10 +1206,11 @@ section_dedicated_ips() {
     return
   fi
 
+  # Field 5 = Local Address:Port — correct for finding connections TO dedicated IPs
   local_ips=$(parse_ss_ips 5)
 
+  local ded_ip ded_label conn_count badge owner
   while read -r ded_ip ded_label; do
-    local conn_count badge owner
     [[ -n "$ded_ip" ]] || continue
 
     conn_count=$(printf '%s\n' "$local_ips" | awk -v ip="$ded_ip" '$0 == ip { c++ } END { print c + 0 }')
@@ -666,9 +1228,6 @@ section_dedicated_ips() {
     echo -e "  ${C_DIM}No active connections to dedicated IPs at this time.${C_RST}"
 }
 
-# -----------------------------------------------------------------------------
-# SECTION: Server summary and quick capacity snapshot
-# -----------------------------------------------------------------------------
 section_summary() {
   local total_conn load_avg mem_info uptime_str dom_count ssl_count entry
 
@@ -692,9 +1251,9 @@ section_summary() {
     "Hosted domains" "$dom_count" "$ssl_count"
 }
 
-# -----------------------------------------------------------------------------
-# RENDER — Collect fresh data, then draw the full-screen dashboard
-# -----------------------------------------------------------------------------
+
+# RENDER
+
 draw_screen() {
   local ts
   ts=$(date '+%Y-%m-%d  %H:%M:%S')
@@ -706,7 +1265,7 @@ draw_screen() {
 
   clear
 
-  echo -e "${C_BLD}${C_WHT}  Traffic Monitor Analysis${C_RST}  ${C_DIM}cPanel / WHM v1.2${C_RST}"
+  echo -e "${C_BLD}${C_WHT}  Traffic Monitor Analysis${C_RST}  ${C_DIM}cPanel / WHM v1.4-fix${C_RST}"
   printf  "  ${C_DIM}%s${C_RST}  |  interface: ${C_BLD}%s${C_RST}\n" "${ts}" "${IFACE}"
   separator
 
@@ -720,19 +1279,49 @@ draw_screen() {
   section_bandwidth
   echo ""
 
-  echo -e "  ${C_BLD}${C_CYN}▸  TOP DOMAINS BY REQUEST COUNT${C_RST}  ${C_DIM}(http + https aggregated)${C_RST}"
+  echo -e "  ${C_BLD}${C_CYN}▸  ATTACK SUMMARY${C_RST}  ${C_DIM}(current sample window)${C_RST}"
+  separator
+  section_attack_summary
+  echo ""
+
+  echo -e "  ${C_BLD}${C_CYN}▸  TOP DOMAINS BY REQUEST COUNT${C_RST}  ${C_DIM}($(request_view_hint))${C_RST}"
   separator
   section_top_domains
   echo ""
 
-  echo -e "  ${C_BLD}${C_CYN}▸  ACTIVE CONNECTIONS PER IP${C_RST}  ${C_DIM}(live via ss)${C_RST}"
+  echo -e "  ${C_BLD}${C_CYN}▸  ACTIVE WEB CONNECTIONS PER IP${C_RST}  ${C_DIM}(local ports 80/443 via ss)${C_RST}"
   separator
   section_active_connections
   echo ""
 
-  echo -e "  ${C_BLD}${C_CYN}▸  TOP SOURCE IPs  —  ALL DOMAINS${C_RST}  ${C_DIM}(aggregated from domlogs)${C_RST}"
+  echo -e "  ${C_BLD}${C_CYN}▸  TOP SOURCE IPs  —  ALL DOMAINS${C_RST}  ${C_DIM}($(request_view_hint))${C_RST}"
   separator
   section_top_ips_global
+  echo ""
+
+  echo -e "  ${C_BLD}${C_CYN}▸  TOP DOMAINS BY 4xx/5xx${C_RST}  ${C_DIM}($(request_view_hint))${C_RST}"
+  separator
+  section_top_domains_errors
+  echo ""
+
+  echo -e "  ${C_BLD}${C_CYN}▸  TOP IPs BY 4xx/5xx${C_RST}  ${C_DIM}($(request_view_hint))${C_RST}"
+  separator
+  section_top_ips_errors
+  echo ""
+
+  echo -e "  ${C_BLD}${C_CYN}▸  TOP REQUEST PATHS${C_RST}  ${C_DIM}(recent cached log sample)${C_RST}"
+  separator
+  section_top_paths
+  echo ""
+
+  echo -e "  ${C_BLD}${C_CYN}▸  TOP USER-AGENTS${C_RST}  ${C_DIM}(recent cached log sample)${C_RST}"
+  separator
+  section_top_user_agents
+  echo ""
+
+  echo -e "  ${C_BLD}${C_CYN}▸  HTTP STATUS CODES${C_RST}  ${C_DIM}(parsed responses from recent cached log sample)${C_RST}"
+  separator
+  section_status_codes
   echo ""
 
   echo -e "  ${C_BLD}${C_CYN}▸  SOURCE IP  →  TARGET DOMAIN${C_RST}  ${C_DIM}(attack vector mapping)${C_RST}"
@@ -751,23 +1340,36 @@ draw_screen() {
   echo ""
 
   separator
-  printf "  ${C_DIM}Refreshing in %s seconds   |   Press Ctrl+C to exit${C_RST}\n" \
-    "$((REFRESH - 1))"
+  printf "  ${C_DIM}Next refresh in ~%s seconds   |   Press Ctrl+C to exit${C_RST}\n" \
+    "$REFRESH"
   echo ""
 }
 
-# =============================================================================
-# MAIN
-# =============================================================================
-clear
-echo ""
-echo -e "${C_BLD}${C_WHT}  Traffic Monitor Analysis${C_RST}  ${C_DIM}cPanel / WHM v1.2${C_RST}"
-separator
+# MAIN  — FIX #1: Wrapped in main() function (removed dangling })
+main() {
+  clear
+  echo ""
+  echo -e "${C_BLD}${C_WHT}  Traffic Monitor Analysis${C_RST}  ${C_DIM}cPanel / WHM v1.4-fix${C_RST}"
+  separator
 
-validate_environment
-init_tmpdir
+  validate_environment
+  init_tmpdir
+  preload_owner_cache
 
-while true; do
-  draw_screen
-  sleep $(( REFRESH - 1 ))
-done
+  # FIX #10: Track wall-clock time for accurate refresh interval
+  while true; do
+    (( SHUTDOWN_REQUESTED == 1 )) && break
+    local cycle_start cycle_end elapsed sleep_time
+    cycle_start=$(date +%s)
+
+    draw_screen
+
+    cycle_end=$(date +%s)
+    elapsed=$(( cycle_end - cycle_start ))
+    sleep_time=$(( REFRESH - elapsed ))
+    (( sleep_time < 1 )) && sleep_time=1
+    sleep "$sleep_time"
+  done
+}
+
+main "$@"
